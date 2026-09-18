@@ -27,6 +27,9 @@ export enum VulnerabilityType {
   CONFIGURATION_ERROR = 'configuration_error',
   INSECURE_TRANSPORT = 'insecure_transport',
   AUTHENTICATION_BYPASS = 'authentication_bypass',
+  DEPENDENCY_VULNERABILITY = 'dependency_vulnerability',
+  HARDCODED_SECRET = 'hardcoded_secret',
+  DOCKERFILE_MISCONFIGURATION = 'dockerfile_misconfiguration',
 }
 
 export enum AnalysisType {

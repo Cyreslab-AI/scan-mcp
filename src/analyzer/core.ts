@@ -28,10 +28,51 @@ import {
 } from '@/types';
 import { vulnerabilityPatternDatabase } from '@/database/vulnerability-patterns';
 import { cveMappingDatabase } from '@/database/cve-mappings';
+import { VulnerabilityDetector } from '@/vulnerabilities/base';
+import { commandInjectionDetector } from '@/vulnerabilities/command-injection';
+import { pathTraversalDetector } from '@/vulnerabilities/path-traversal';
+import { promptInjectionDetector } from '@/vulnerabilities/prompt-injection';
+import { toolPoisoningDetector } from '@/vulnerabilities/tool-poisoning';
+import { analyzeToolDescriptions } from '@/vulnerabilities/tool-description-poisoning';
+import { detectSecrets } from '@/vulnerabilities/secrets';
+import { dockerfileLinter } from '@/vulnerabilities/dockerfile-lint';
+import { dependencyScanner } from '@/scanners/dependency-scanner';
+import { scannerRegistry } from '@/scanners/base';
+import { typeScriptScanner } from '@/scanners/typescript';
+import { pythonScanner } from '@/scanners/python';
+import { LanguageVulnerabilityPattern } from '@/types/language';
+
+// Importing the scanners above registers them into `scannerRegistry` as a side effect; reference
+// them so bundlers/linters don't consider the import "unused" if tree-shaken oddly.
+void typeScriptScanner;
+void pythonScanner;
 
 export class SecurityAnalyzer {
   private patterns: Map<LanguageType, VulnerabilityPattern[]> = new Map();
   private scanProgress: Map<string, ScanProgress> = new Map();
+  // Context-aware detectors (previously implemented but never invoked by the scan pipeline -
+  // core.ts used only the flat regex pattern database below). These bring confidence scoring,
+  // severity escalation, and false-positive-risk assessment based on surrounding code context.
+  private readonly dedicatedDetectors: VulnerabilityDetector[] = [
+    commandInjectionDetector,
+    pathTraversalDetector,
+    promptInjectionDetector,
+    toolPoisoningDetector,
+  ];
+  // Vulnerability types fully handled by a dedicated detector/module above; the generic
+  // pattern-database fallback below skips these to avoid duplicate/lower-quality findings for the
+  // same issue. (A few entries - dockerfile/secrets/dependency ones - exist in the pattern
+  // database purely so `get_vulnerability_patterns` can document them; actual detection for those
+  // always goes through the dedicated modules, never this generic regex path.)
+  private readonly typesWithDedicatedDetectors = new Set<VulnerabilityType>([
+    VulnerabilityType.COMMAND_INJECTION,
+    VulnerabilityType.PATH_TRAVERSAL,
+    VulnerabilityType.PROMPT_INJECTION,
+    VulnerabilityType.TOOL_POISONING,
+    VulnerabilityType.DOCKERFILE_MISCONFIGURATION,
+    VulnerabilityType.HARDCODED_SECRET,
+    VulnerabilityType.DEPENDENCY_VULNERABILITY,
+  ]);
 
   constructor() {
     this.initializePatterns();
@@ -83,9 +124,33 @@ export class SecurityAnalyzer {
         progress.progress = 70;
       }
 
+      // Dependency vulnerability scanning (OSV.dev) - reads package.json/requirements.txt under
+      // the scan target and checks every dependency against OSV's free, public database.
+      progress.currentPhase = 'Dependency Scanning';
+      const depScan = await dependencyScanner
+        .scan(source, options.excludePaths, options.maxDepth)
+        .catch((error): { dependencies: never[]; vulnerabilities: never[]; warnings: string[] } => ({
+          dependencies: [],
+          vulnerabilities: [],
+          warnings: [`Dependency scan failed: ${error instanceof Error ? error.message : String(error)}`],
+        }));
+      targetInfo.dependencies = depScan.dependencies;
+      for (const warning of depScan.warnings) {
+        progress.errors.push({
+          type: 'analysis',
+          message: warning,
+          severity: 'warning',
+          timestamp: new Date(),
+        });
+      }
+      progress.progress = 85;
+
       // Aggregate vulnerabilities
       progress.currentPhase = 'Aggregating Results';
-      const allVulnerabilities = staticResults.flatMap(result => result.vulnerabilities);
+      const allVulnerabilities = [
+        ...staticResults.flatMap(result => result.vulnerabilities),
+        ...depScan.vulnerabilities,
+      ];
       progress.vulnerabilitiesFound = allVulnerabilities.length;
       progress.progress = 90;
 
@@ -267,9 +332,36 @@ export class SecurityAnalyzer {
       
       try {
         const content = await fs.readFile(target.path, 'utf-8');
+
+        // Dockerfiles get real hadolint-equivalent linting instead of the AST-based JS/TS/Python
+        // pipeline below (dockerfile-ast, not esprima, understands FROM/RUN/USER/ENV semantics).
+        if (target.language === LanguageType.DOCKERFILE) {
+          const vulnerabilities = [
+            ...dockerfileLinter.lint(target.path, content),
+            ...detectSecrets(content, target.path),
+          ];
+
+          results.push({
+            ast: {},
+            symbols: { functions: [], classes: [], variables: [], imports: [], exports: [] },
+            dependencies: [],
+            vulnerabilities,
+            metrics: {
+              linesOfCode: content.split('\n').length,
+              complexity: 1,
+              maintainabilityIndex: 100,
+              technicalDebt: 0,
+            },
+          });
+
+          progress.processedFiles++;
+          progress.progress = 10 + Math.floor((progress.processedFiles / progress.totalFiles) * 60);
+          continue;
+        }
+
         const ast = await this.parseFile(target.path, content, target.language);
         const symbols = this.extractSymbols(ast);
-        const vulnerabilities = await this.detectVulnerabilities(ast, target.language);
+        const vulnerabilities = await this.detectVulnerabilities(ast, content, target.language);
 
         results.push({
           ast: ast.ast as unknown as Record<string, unknown>,
@@ -315,7 +407,7 @@ export class SecurityAnalyzer {
             range: true,
             tolerant: true,
           });
-          ast = this.convertEsprimaASTToStandard(jsResult);
+          ast = this.convertEsprimaASTToStandard(jsResult, content);
           break;
 
         default:
@@ -391,14 +483,19 @@ export class SecurityAnalyzer {
     };
   }
 
-  private convertEsprimaASTToStandard(esprimaAst: any): ASTNode {
+  private convertEsprimaASTToStandard(esprimaAst: any, content?: string): ASTNode {
     return {
       type: esprimaAst.type || 'Unknown',
       start: esprimaAst.range?.[0] || 0,
       end: esprimaAst.range?.[1] || 0,
       loc: esprimaAst.loc,
       children: Array.isArray(esprimaAst.body) ? esprimaAst.body.map((child: any) => this.convertEsprimaASTToStandard(child)) : [],
-      properties: { ...esprimaAst },
+      // NOTE: esprima's own Program node has no `content` field. Previously this spread left
+      // `properties.content` undefined for every successfully-parsed file, which silently broke
+      // all AST-content-based pattern matching below (it only ever "worked" by accident, when a
+      // file failed to parse and fell back to the minimal AST that does set `content`). Passing
+      // `content` through explicitly fixes that for real.
+      properties: { ...esprimaAst, ...(content !== undefined ? { content } : {}) },
     };
   }
 
@@ -413,16 +510,143 @@ export class SecurityAnalyzer {
     };
   }
 
-  private async detectVulnerabilities(ast: LanguageAST, language: LanguageType): Promise<Vulnerability[]> {
+  private async detectVulnerabilities(ast: LanguageAST, content: string, language: LanguageType): Promise<Vulnerability[]> {
     const vulnerabilities: Vulnerability[] = [];
-    const patterns = this.patterns.get(language) || [];
 
-    for (const pattern of patterns) {
+    // Context-aware detectors (command injection, path traversal, prompt injection, and
+    // tool-poisoning-via-handler-code). These were previously fully implemented but never
+    // called from anywhere in the scan pipeline.
+    for (const detector of this.dedicatedDetectors) {
+      if (detector.supportsLanguage(language)) {
+        vulnerabilities.push(...await detector.detect(ast, content));
+      }
+    }
+
+    // Tool-description-based poisoning detection: the actual, documented MCP "tool poisoning" /
+    // "rug pull" attack surface (hidden Unicode, LLM-directed instructions, description/behavior
+    // mismatches in tool metadata) rather than handler code.
+    if (
+      language === LanguageType.TYPESCRIPT ||
+      language === LanguageType.JAVASCRIPT ||
+      language === LanguageType.PYTHON
+    ) {
+      vulnerabilities.push(...analyzeToolDescriptions(content, ast.filePath));
+    }
+
+    // Extra language-specific regex patterns contributed by the language scanners (unsafe `any`,
+    // insecure Math.random(), Python pickle/SQL-injection/subprocess checks, etc.). These pattern
+    // lists existed in src/scanners/*.ts but were only reachable through methods nothing called.
+    const scanner = scannerRegistry.getScannerForFile(ast.filePath);
+    if (scanner) {
+      // Skip patterns that substantially duplicate a dedicated detector's coverage above (e.g.
+      // Python's subprocess shell=True / eval-exec / path-traversal patterns) so the same issue
+      // isn't reported twice under two different vulnerability types; keep the genuinely
+      // additional checks (unsafe `any`, insecure randomness, pickle deserialization, SQL
+      // injection via string formatting) that nothing else in the pipeline covers.
+      const excludedScannerPatterns = new Set([
+        // Substantially duplicate a dedicated detector's coverage above.
+        'py_subprocess_shell_injection',
+        'py_eval_exec_injection',
+        'py_path_traversal',
+        'ts_exec_template_literal',
+        'ts_path_traversal_template',
+        // Match every `any` annotation / `as X` assertion in a file with no security-relevant
+        // context at all. On this very codebase they accounted for ~80% of all findings (298 of
+        // 369) with essentially no signal - idiomatic, safe TypeScript triggers them constantly.
+        // A general type-safety linter is a legitimate tool, but flagging every occurrence as a
+        // "vulnerability" would wreck this scanner's precision, so they're deliberately excluded.
+        'ts_unsafe_any',
+        'ts_unsafe_type_assertion',
+      ]);
+      const extraPatterns = scanner.getVulnerabilityPatterns().filter(p => !excludedScannerPatterns.has(p.id));
+      vulnerabilities.push(...this.matchScannerPatterns(content, ast.filePath, extraPatterns));
+    }
+
+    // Secrets scanning applies to every text file regardless of language.
+    vulnerabilities.push(...detectSecrets(content, ast.filePath));
+
+    // Remaining generic patterns from the regex pattern database (currently just OAuth) that
+    // aren't already covered by one of the dedicated detectors above.
+    const genericPatterns = (this.patterns.get(language) || [])
+      .filter(pattern => !this.typesWithDedicatedDetectors.has(pattern.type));
+
+    for (const pattern of genericPatterns) {
       const matches = await this.matchPattern(ast, pattern);
       vulnerabilities.push(...matches);
     }
 
     return vulnerabilities;
+  }
+
+  /**
+   * Apply a language scanner's own `LanguageVulnerabilityPattern` regex rules directly against
+   * raw file content. (Deliberately does not call the scanners' own `analyzeCode`/`matchPattern`,
+   * which read `ast.ast.properties.content` - a field their `parseFile()` never actually
+   * populates for successfully-parsed TypeScript, the same latent bug fixed above for core.ts's
+   * own AST conversion.)
+   */
+  private matchScannerPatterns(
+    content: string,
+    filePath: string,
+    patterns: LanguageVulnerabilityPattern[]
+  ): Vulnerability[] {
+    const vulnerabilities: Vulnerability[] = [];
+
+    for (const pattern of patterns) {
+      if (pattern.pattern.type !== 'regex') continue;
+      const matcher = pattern.pattern.matcher as { pattern: RegExp };
+      if (!(matcher.pattern instanceof RegExp)) continue;
+
+      const regex = new RegExp(matcher.pattern.source, matcher.pattern.flags.includes('g') ? matcher.pattern.flags : `${matcher.pattern.flags}g`);
+      const severity = this.mapLanguagePatternSeverity(pattern.severity);
+
+      for (const match of content.matchAll(regex)) {
+        if (match.index === undefined) continue;
+        const lines = content.substring(0, match.index).split('\n');
+        const line = lines.length;
+        const column = lines[lines.length - 1]?.length || 0;
+
+        vulnerabilities.push({
+          id: this.generateVulnerabilityId(),
+          type: VulnerabilityType.CONFIGURATION_ERROR,
+          severity,
+          score: this.severityToScore(severity),
+          title: pattern.name,
+          description: pattern.description,
+          location: { file: filePath, line, column },
+          remediation: {
+            title: `Fix ${pattern.name}`,
+            description: pattern.description,
+            steps: pattern.remediation,
+            references: pattern.references,
+            effort: severity === SeverityLevel.CRITICAL ? 'high' : 'medium',
+            priority: severity === SeverityLevel.CRITICAL ? 1 : 2,
+          },
+          cveReferences: pattern.cweId ? this.getCVEReferences(pattern.cweId) : [],
+          context: {
+            pattern: pattern.id,
+            match: match[0],
+            detectionMethod: 'language-scanner-pattern',
+          },
+          detectedAt: new Date(),
+          confidence: 0.75,
+          falsePositiveRisk: 'medium',
+          tags: [pattern.language, severity, ...pattern.tags],
+        });
+      }
+    }
+
+    return vulnerabilities;
+  }
+
+  private mapLanguagePatternSeverity(severity: 'critical' | 'high' | 'medium' | 'low'): SeverityLevel {
+    switch (severity) {
+      case 'critical': return SeverityLevel.CRITICAL;
+      case 'high': return SeverityLevel.HIGH;
+      case 'medium': return SeverityLevel.MEDIUM;
+      case 'low': return SeverityLevel.LOW;
+      default: return SeverityLevel.LOW;
+    }
   }
 
   private async matchPattern(ast: LanguageAST, pattern: VulnerabilityPattern): Promise<Vulnerability[]> {
@@ -620,6 +844,22 @@ export class SecurityAnalyzer {
 
     if (vulnerabilities.some(v => v.type === VulnerabilityType.PROMPT_INJECTION)) {
       recommendations.push('Implement prompt injection defenses');
+    }
+
+    if (vulnerabilities.some(v => v.type === VulnerabilityType.TOOL_POISONING && v.context?.['detectionMethod'] === 'tool-description-analysis')) {
+      recommendations.push('Audit every tool name/description/parameter for hidden Unicode or LLM-directed instructions, and diff them against previous releases before publishing');
+    }
+
+    if (vulnerabilities.some(v => v.type === VulnerabilityType.DOCKERFILE_MISCONFIGURATION)) {
+      recommendations.push('Fix Dockerfile best-practice violations (pin base images, run as a non-root user, avoid baking secrets into layers)');
+    }
+
+    if (vulnerabilities.some(v => v.type === VulnerabilityType.HARDCODED_SECRET)) {
+      recommendations.push('Rotate and remove all hardcoded credentials; move secrets to environment variables or a secrets manager');
+    }
+
+    if (vulnerabilities.some(v => v.type === VulnerabilityType.DEPENDENCY_VULNERABILITY)) {
+      recommendations.push('Upgrade dependencies with known vulnerabilities reported by OSV.dev');
     }
 
     if (vulnerabilities.some(v => v.severity === SeverityLevel.CRITICAL)) {

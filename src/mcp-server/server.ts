@@ -262,7 +262,13 @@ export class McpSecurityServer {
         tools: [
           {
             name: 'scan_mcp_server',
-            description: 'Perform comprehensive security scan on MCP server code',
+            description: 'Perform a comprehensive security scan on MCP server code: static ' +
+              'AST/regex analysis for command injection, path traversal, and prompt injection; ' +
+              'tool-poisoning detection for BOTH dangerous handler code and malicious/hidden ' +
+              'instructions embedded in tool descriptions or metadata; Dockerfile linting ' +
+              '(unpinned base images, apt-get layering, missing non-root USER, ADD-vs-COPY, ' +
+              'secrets in ENV/ARG); hardcoded-secret scanning (regex + entropy); and dependency ' +
+              'vulnerability scanning of package.json/requirements.txt against the live OSV.dev database.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -282,9 +288,9 @@ export class McpSecurityServer {
                     },
                     targetLanguages: {
                       type: 'array',
-                      items: { 
+                      items: {
                         type: 'string',
-                        enum: ['typescript', 'javascript', 'python', 'go', 'rust'],
+                        enum: ['typescript', 'javascript', 'python', 'go', 'rust', 'dockerfile'],
                       },
                       description: 'Target programming languages to scan',
                     },
@@ -327,9 +333,11 @@ export class McpSecurityServer {
             outputSchema: SCAN_RESULT_OUTPUT_SCHEMA,
             annotations: {
               readOnlyHint: true,
-              // Reads local source files / Docker images passed in `source`; does not call
-              // out to any external network resource.
-              openWorldHint: false,
+              // Reads local source files / Docker images passed in `source`. As of the
+              // dependency-vulnerability scanner, this now also makes outbound HTTPS requests to
+              // the public OSV.dev API to check package.json/requirements.txt dependencies -
+              // network failures there are handled gracefully and never fail the overall scan.
+              openWorldHint: true,
             },
           },
 
@@ -341,12 +349,21 @@ export class McpSecurityServer {
               properties: {
                 language: {
                   type: 'string',
-                  enum: ['typescript', 'javascript', 'python', 'go', 'rust'],
+                  enum: ['typescript', 'javascript', 'python', 'go', 'rust', 'dockerfile', 'json'],
                   description: 'Filter patterns by programming language',
                 },
                 type: {
                   type: 'string',
-                  enum: ['command_injection', 'path_traversal', 'prompt_injection', 'tool_poisoning'],
+                  enum: [
+                    'command_injection',
+                    'path_traversal',
+                    'prompt_injection',
+                    'tool_poisoning',
+                    'oauth_vulnerability',
+                    'dockerfile_misconfiguration',
+                    'hardcoded_secret',
+                    'dependency_vulnerability',
+                  ],
                   description: 'Filter patterns by vulnerability type',
                 },
                 severity: {
