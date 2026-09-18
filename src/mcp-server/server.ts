@@ -8,6 +8,229 @@ import { cveMappingDatabase } from '@/database/cve-mappings';
 import { ScanOptions } from '@/types/scan';
 import { AnalysisType, SeverityLevel } from '@/types';
 
+/**
+ * JSON Schema describing the structured shape of a ScanResult (see src/types/scan.ts),
+ * as actually produced by SecurityAnalyzer.scanServer() and returned by scan_mcp_server.
+ */
+const SCAN_RESULT_OUTPUT_SCHEMA = {
+  type: 'object',
+  description: 'Result of a comprehensive MCP server security scan',
+  properties: {
+    scanId: { type: 'string' },
+    targetInfo: {
+      type: 'object',
+      properties: {
+        totalFiles: { type: 'number' },
+        totalLines: { type: 'number' },
+        languageBreakdown: { type: 'object', additionalProperties: { type: 'number' } },
+        dependencies: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              version: { type: 'string' },
+              source: { type: 'string', enum: ['npm', 'pip', 'cargo', 'go.mod', 'unknown'] },
+              vulnerabilities: { type: 'array', items: { type: 'string' } },
+              outdated: { type: 'boolean' },
+              license: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    scanOptions: { type: 'object', additionalProperties: true },
+    progress: { type: 'object', additionalProperties: true },
+    vulnerabilities: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          type: { type: 'string' },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'] },
+          score: { type: 'number' },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          location: {
+            type: 'object',
+            properties: {
+              file: { type: 'string' },
+              line: { type: 'number' },
+              column: { type: 'number' },
+              length: { type: 'number' },
+              function: { type: 'string' },
+              class: { type: 'string' },
+              method: { type: 'string' },
+            },
+            required: ['file', 'line', 'column'],
+          },
+          remediation: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              description: { type: 'string' },
+              steps: { type: 'array', items: { type: 'string' } },
+              codeExample: { type: 'string' },
+              references: { type: 'array', items: { type: 'string' } },
+              effort: { type: 'string', enum: ['low', 'medium', 'high'] },
+              priority: { type: 'number' },
+            },
+          },
+          cveReferences: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                url: { type: 'string' },
+                description: { type: 'string' },
+                score: { type: 'number' },
+                vector: { type: 'string' },
+              },
+            },
+          },
+          confidence: { type: 'number' },
+          falsePositiveRisk: { type: 'string', enum: ['low', 'medium', 'high'] },
+          tags: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['id', 'type', 'severity', 'title', 'description', 'location'],
+      },
+    },
+    summary: {
+      type: 'object',
+      properties: {
+        totalVulnerabilities: { type: 'number' },
+        vulnerabilityBreakdown: { type: 'object', additionalProperties: { type: 'number' } },
+        typeBreakdown: { type: 'object', additionalProperties: { type: 'number' } },
+        riskScore: { type: 'number' },
+        confidence: { type: 'number' },
+        falsePositiveEstimate: { type: 'number' },
+        recommendedActions: { type: 'array', items: { type: 'string' } },
+      },
+    },
+    metadata: {
+      type: 'object',
+      properties: {
+        scannerVersion: { type: 'string' },
+        scanDuration: { type: 'number' },
+        rulesVersion: { type: 'string' },
+        environment: { type: 'object', additionalProperties: true },
+        performance: { type: 'object', additionalProperties: true },
+      },
+    },
+    generatedAt: { type: 'string', format: 'date-time' },
+  },
+  required: ['scanId', 'vulnerabilities', 'summary'],
+} as const;
+
+/**
+ * JSON Schema for the response of get_vulnerability_patterns, based on the
+ * VulnerabilityPattern shape in src/types/vulnerability.ts.
+ */
+const VULNERABILITY_PATTERNS_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    count: { type: 'number' },
+    patterns: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          name: { type: 'string' },
+          language: { type: 'string' },
+          type: { type: 'string' },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+          description: { type: 'string' },
+          examples: {
+            type: 'object',
+            properties: {
+              vulnerable: { type: 'array', items: { type: 'string' } },
+              safe: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          references: { type: 'array', items: { type: 'string' } },
+          cweId: { type: 'string' },
+          owaspCategory: { type: 'string' },
+        },
+        required: ['id', 'name', 'language', 'type', 'severity'],
+      },
+    },
+  },
+  required: ['count', 'patterns'],
+} as const;
+
+/**
+ * JSON Schema for the response of validate_mcp_config, matching the
+ * validationResults object built in handleValidateConfigRequest.
+ */
+const VALIDATE_CONFIG_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    valid: { type: 'boolean' },
+    issues: { type: 'array', items: { type: 'string' } },
+    recommendations: { type: 'array', items: { type: 'string' } },
+    securityScore: { type: 'number' },
+  },
+  required: ['valid', 'issues', 'recommendations', 'securityScore'],
+} as const;
+
+/**
+ * JSON Schema for the response of get_cve_information, based on the
+ * CVEEntry shape in src/types/database.ts (local, hard-coded CVE mapping data).
+ */
+const CVE_INFORMATION_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    count: { type: 'number' },
+    entries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          description: { type: 'string' },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'] },
+          score: { type: 'number' },
+          vector: { type: 'string' },
+          published: { type: 'string', format: 'date-time' },
+          modified: { type: 'string', format: 'date-time' },
+          references: { type: 'array', items: { type: 'string' } },
+          affectedProducts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                vendor: { type: 'string' },
+                product: { type: 'string' },
+                versions: { type: 'array', items: { type: 'object', additionalProperties: true } },
+                platforms: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+          weaknesses: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                name: { type: 'string' },
+                description: { type: 'string' },
+                category: { type: 'string' },
+              },
+            },
+          },
+          exploitability: { type: 'object', additionalProperties: true },
+          impact: { type: 'object', additionalProperties: true },
+        },
+        required: ['id', 'description', 'severity', 'score'],
+      },
+    },
+  },
+  required: ['count', 'entries'],
+} as const;
+
 export class McpSecurityServer {
   private server: Server;
   private isInitialized = false;
@@ -101,6 +324,13 @@ export class McpSecurityServer {
               required: ['source'],
               additionalProperties: false,
             },
+            outputSchema: SCAN_RESULT_OUTPUT_SCHEMA,
+            annotations: {
+              readOnlyHint: true,
+              // Reads local source files / Docker images passed in `source`; does not call
+              // out to any external network resource.
+              openWorldHint: false,
+            },
           },
 
           {
@@ -127,6 +357,12 @@ export class McpSecurityServer {
               },
               additionalProperties: false,
             },
+            outputSchema: VULNERABILITY_PATTERNS_OUTPUT_SCHEMA,
+            annotations: {
+              readOnlyHint: true,
+              // Looks up patterns from the local, in-memory pattern database only.
+              openWorldHint: false,
+            },
           },
 
           {
@@ -147,6 +383,12 @@ export class McpSecurityServer {
               },
               required: ['config'],
               additionalProperties: false,
+            },
+            outputSchema: VALIDATE_CONFIG_OUTPUT_SCHEMA,
+            annotations: {
+              readOnlyHint: true,
+              // Validates a config object passed in by the caller; no external calls.
+              openWorldHint: false,
             },
           },
 
@@ -173,6 +415,13 @@ export class McpSecurityServer {
                 },
               },
               additionalProperties: false,
+            },
+            outputSchema: CVE_INFORMATION_OUTPUT_SCHEMA,
+            annotations: {
+              readOnlyHint: true,
+              // cveMappingDatabase is a local, hard-coded set of known MCP-related CVEs
+              // (see src/database/cve-mappings.ts) — it does not query a live CVE feed.
+              openWorldHint: false,
             },
           },
         ],
@@ -421,6 +670,7 @@ ${scanResult.vulnerabilities.length > 10 ? `\n*... and ${scanResult.vulnerabilit
           text: JSON.stringify(scanResult, null, 2),
         },
       ],
+      structuredContent: scanResult,
     };
   }
 
@@ -436,11 +686,11 @@ ${scanResult.vulnerabilities.length > 10 ? `\n*... and ${scanResult.vulnerabilit
     if (language) {
       patterns = patterns.filter(p => p.language === language);
     }
-    
+
     if (type) {
       patterns = patterns.filter(p => p.type === type);
     }
-    
+
     if (severity) {
       patterns = patterns.filter(p => p.severity === severity);
     }
@@ -449,7 +699,7 @@ ${scanResult.vulnerabilities.length > 10 ? `\n*... and ${scanResult.vulnerabilit
       content: [
         {
           type: 'text',
-          text: `Found ${patterns.length} vulnerability patterns matching your criteria:\n\n${patterns.map(p => 
+          text: `Found ${patterns.length} vulnerability patterns matching your criteria:\n\n${patterns.map(p =>
             `**${p.name}** (${p.language})\n- Severity: ${p.severity}\n- Type: ${p.type}\n- Description: ${p.description}`
           ).join('\n\n')}`,
         },
@@ -458,6 +708,10 @@ ${scanResult.vulnerabilities.length > 10 ? `\n*... and ${scanResult.vulnerabilit
           text: JSON.stringify(patterns, null, 2),
         },
       ],
+      structuredContent: {
+        count: patterns.length,
+        patterns,
+      },
     };
   }
 
@@ -512,6 +766,7 @@ ${validationResults.issues.length > 0 ? `## Issues Found\n${validationResults.is
 ${validationResults.recommendations.length > 0 ? `## Recommendations\n${validationResults.recommendations.map(rec => `- ${rec}`).join('\n')}` : ''}`,
         },
       ],
+      structuredContent: validationResults,
     };
   }
 
@@ -541,11 +796,15 @@ ${validationResults.recommendations.length > 0 ? `## Recommendations\n${validati
       content: [
         {
           type: 'text',
-          text: `# CVE Information\n\nFound ${cveEntries.length} CVE entries:\n\n${cveEntries.slice(0, 5).map(cve => 
+          text: `# CVE Information\n\nFound ${cveEntries.length} CVE entries:\n\n${cveEntries.slice(0, 5).map(cve =>
             `## ${cve.id}\n- **Severity**: ${cve.severity} (${cve.score})\n- **Description**: ${cve.description}\n- **Published**: ${cve.published.toDateString()}`
           ).join('\n\n')}${cveEntries.length > 5 ? `\n\n*... and ${cveEntries.length - 5} more entries*` : ''}`,
         },
       ],
+      structuredContent: {
+        count: cveEntries.length,
+        entries: cveEntries,
+      },
     };
   }
 
