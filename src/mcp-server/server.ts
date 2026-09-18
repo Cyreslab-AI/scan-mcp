@@ -1,12 +1,6 @@
 // Secure MCP server implementation with comprehensive input sanitization
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { 
-  CallToolRequestSchema,
-  ErrorCode,
-  ListToolsRequestSchema,
-  McpError,
-} from '@modelcontextprotocol/sdk/types.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { Server, ProtocolError, ProtocolErrorCode } from '@modelcontextprotocol/server';
 
 import { securityAnalyzer } from '@/analyzer/core';
 import { vulnerabilityPatternDatabase } from '@/database/vulnerability-patterns';
@@ -40,7 +34,7 @@ export class McpSecurityServer {
    * Setup MCP tool handlers with input sanitization
    */
   private setupToolHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    this.server.setRequestHandler('tools/list', async (): Promise<any> => {
       return {
         tools: [
           {
@@ -185,7 +179,7 @@ export class McpSecurityServer {
       };
     });
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler('tools/call', async (request) => {
       const { name, arguments: args } = request.params;
 
       try {
@@ -206,14 +200,14 @@ export class McpSecurityServer {
             return await this.handleGetCVERequest(sanitizedArgs);
             
           default:
-            throw new McpError(
-              ErrorCode.MethodNotFound,
+            throw new ProtocolError(
+              ProtocolErrorCode.MethodNotFound,
               `Unknown tool: ${name}`
             );
         }
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InternalError,
+        throw new ProtocolError(
+          ProtocolErrorCode.InternalError,
           `Tool execution failed: ${error instanceof Error ? error.message : 'Unknown error'}`
         );
       }
@@ -301,7 +295,7 @@ export class McpSecurityServer {
    */
   private sanitizeFilePath(filePath: any): string {
     if (typeof filePath !== 'string') {
-      throw new McpError(ErrorCode.InvalidParams, 'File path must be a string');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'File path must be a string');
     }
 
     // Remove dangerous sequences
@@ -313,16 +307,16 @@ export class McpSecurityServer {
 
     // Validate length
     if (sanitized.length === 0) {
-      throw new McpError(ErrorCode.InvalidParams, 'File path cannot be empty');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'File path cannot be empty');
     }
 
     if (sanitized.length > 1000) {
-      throw new McpError(ErrorCode.InvalidParams, 'File path too long');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'File path too long');
     }
 
     // Ensure it's a reasonable path
     if (!/^[a-zA-Z0-9._/-]+$/.test(sanitized)) {
-      throw new McpError(ErrorCode.InvalidParams, 'File path contains invalid characters');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'File path contains invalid characters');
     }
 
     return sanitized;
@@ -358,12 +352,12 @@ export class McpSecurityServer {
    */
   private sanitizeCVEId(cveId: any): string {
     if (typeof cveId !== 'string') {
-      throw new McpError(ErrorCode.InvalidParams, 'CVE ID must be a string');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'CVE ID must be a string');
     }
 
     const cvePattern = /^CVE-\d{4}-\d{4,}$/;
     if (!cvePattern.test(cveId)) {
-      throw new McpError(ErrorCode.InvalidParams, 'Invalid CVE ID format');
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, 'Invalid CVE ID format');
     }
 
     return cveId;
